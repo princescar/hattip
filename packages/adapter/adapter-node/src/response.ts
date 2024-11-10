@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/ban-ts-comment */
 import { ServerResponse } from "node:http";
-import { Readable } from "node:stream";
 import { rawBodySymbol } from "./raw-body-symbol";
+import { DecoratedRequest } from "./common";
 
 // @ts-ignore
 const deno = typeof Deno !== "undefined";
@@ -23,50 +23,92 @@ if (deno) {
  * Send a fetch API Response into a Node.js HTTP response stream.
  */
 export async function sendResponse(
+	req: DecoratedRequest,
+	res: ServerResponse,
 	fetchResponse: Response,
-	nodeResponse: ServerResponse,
 ): Promise<void> {
+	const controller = new AbortController();
+	const signal = controller.signal;
+
+	req.once("close", () => {
+		controller.abort();
+	});
+
+	res.once("close", () => {
+		controller.abort();
+	});
+
+	const hasContentLength = fetchResponse.headers.has("Content-Length");
+
 	if ((fetchResponse as any)[rawBodySymbol]) {
-		writeHead(fetchResponse, nodeResponse);
-		nodeResponse.end((fetchResponse as any)[rawBodySymbol]);
+		writeHead(fetchResponse, res);
+		res.end((fetchResponse as any)[rawBodySymbol]);
 		return;
 	}
 
-	const { body: fetchBody } = fetchResponse;
-
-	let body: Readable | null = null;
-	if (!deno && fetchBody instanceof Readable) {
-		body = fetchBody;
-	} else if (fetchBody instanceof ReadableStream) {
-		if (!deno && Readable.fromWeb) {
-			// Available in Node.js 17+
-			body = Readable.fromWeb(fetchBody as any);
-		} else {
-			const reader = fetchBody.getReader();
-			body = new Readable({
-				async read() {
-					const { done, value } = await reader.read();
-					this.push(done ? null : value);
-				},
-			});
+	const body = fetchResponse.body;
+	if (!body) {
+		// Deno doesn't handle Content-Length automatically
+		if (!hasContentLength) {
+			res.setHeader("Content-Length", "0");
 		}
-	} else if (fetchBody) {
-		body = Readable.from(fetchBody as any);
+		writeHead(fetchResponse, res);
+		res.end();
+		return;
 	}
 
-	writeHead(fetchResponse, nodeResponse);
+	let setImmediateFired = false;
+	setImmediate(() => {
+		setImmediateFired = true;
+	});
 
-	if (body) {
-		body.pipe(nodeResponse);
-		await new Promise((resolve, reject) => {
-			body!.on("error", reject);
-			nodeResponse.on("finish", resolve);
-			nodeResponse.on("error", reject);
-		});
-	} else {
-		nodeResponse.setHeader("content-length", "0");
-		nodeResponse.end();
+	const chunks: Uint8Array[] = [];
+	let bufferWritten = false;
+	for await (const chunk of body) {
+		if (signal.aborted) {
+			body.cancel().catch(() => {});
+			return;
+		}
+		if (setImmediateFired) {
+			if (!bufferWritten) {
+				writeHead(fetchResponse, res);
+				for (const chunk of chunks) {
+					await writeAndAwait(chunk, res, signal);
+					if (signal.aborted) {
+						body.cancel().catch(() => {});
+						return;
+					}
+				}
+
+				bufferWritten = true;
+			}
+
+			await writeAndAwait(chunk, res, signal);
+			if (signal.aborted) {
+				body.cancel().catch(() => {});
+				return;
+			}
+		} else {
+			chunks.push(chunk);
+		}
 	}
+
+	if (signal.aborted) return;
+
+	if (setImmediateFired) {
+		res.end();
+		return;
+	}
+
+	// We were able to read the whole body. Write at once.
+	const buffer = Buffer.concat(chunks);
+
+	// Deno doesn't handle Content-Length automatically
+	if (!hasContentLength) {
+		res.setHeader("Content-Length", buffer.length);
+	}
+	writeHead(fetchResponse, res);
+	res.end(buffer);
 }
 
 function writeHead(fetchResponse: Response, nodeResponse: ServerResponse) {
@@ -84,5 +126,36 @@ function writeHead(fetchResponse: Response, nodeResponse: ServerResponse) {
 		} else {
 			nodeResponse.setHeader(key, fetchResponse.headers.get(key)!);
 		}
+	}
+}
+
+async function writeAndAwait(
+	chunk: Uint8Array,
+	res: ServerResponse,
+	signal: AbortSignal,
+) {
+	const written = res.write(chunk);
+	if (!written) {
+		await new Promise<void>((resolve, reject) => {
+			function cleanup() {
+				res.off("drain", success);
+				res.off("error", failure);
+				signal.removeEventListener("abort", success);
+			}
+
+			function success() {
+				cleanup();
+				resolve();
+			}
+
+			function failure(reason: unknown) {
+				cleanup();
+				reject(reason);
+			}
+
+			res.once("drain", success);
+			res.once("error", reject);
+			signal.addEventListener("abort", success);
+		});
 	}
 }

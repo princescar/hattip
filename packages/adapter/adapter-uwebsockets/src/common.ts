@@ -7,6 +7,7 @@ import {
 	SSLApp,
 	TemplatedApp,
 } from "uWebSockets.js";
+import { STATUS_CODES } from "node:http";
 
 /** Adapter options */
 export interface UWebSocketAdapterOptions {
@@ -77,8 +78,15 @@ export function createServer(
 	configureServer?.(app);
 
 	return app.any("/*", (res, req) => {
-		let aborted = false;
-		res.onAborted(() => (aborted = true));
+		let finished = false;
+		const controller = new AbortController();
+		const signal = controller.signal;
+
+		res.onAborted(() => {
+			if (!finished) {
+				controller.abort();
+			}
+		});
 
 		const method = req.getCaseSensitiveMethod();
 		const path = req.getUrl();
@@ -118,12 +126,20 @@ export function createServer(
 		const url = protocol + "://" + host + path + (query ? "?" + query : "");
 
 		function handleError(error: unknown) {
-			if (aborted) return;
+			if (controller.signal.aborted) return;
 
 			console.error(error);
 
-			res.writeStatus("500 Internal Server Error");
-			res.end();
+			try {
+				if (!controller.signal.aborted) {
+					res.cork(() => {
+						res.writeStatus("500 Internal Server Error");
+						res.endWithoutBody();
+					});
+				}
+			} catch {
+				// Ignore error
+			}
 		}
 
 		try {
@@ -146,13 +162,15 @@ export function createServer(
 				request: new Request(url, {
 					method,
 					headers,
+					signal: controller.signal,
 					body:
 						method === "GET" || method === "HEAD"
 							? undefined
 							: new ReadableStream({
 									start(controller) {
 										res.onData((chunk, isLast) => {
-											controller.enqueue(new Uint8Array(chunk));
+											// The .slice here is required to here to allow chunked bodies :(
+											controller.enqueue(new Uint8Array(chunk.slice(0)));
 											if (isLast) controller.close();
 										});
 									},
@@ -172,14 +190,22 @@ export function createServer(
 		}
 
 		async function finish(response: Response) {
-			if (aborted) return;
+			const body = response.body;
+			if (controller.signal.aborted) {
+				if (body) {
+					body.cancel().catch(() => {});
+				}
+				return;
+			}
 
-			res.cork(() => {
-				res.writeStatus(
-					`${response.status}${
-						response.statusText ? " " + response.statusText : ""
-					}`,
-				);
+			function writeHead() {
+				let statusLine = `${response.status}`;
+				const statusText = response.statusText || STATUS_CODES[response.status];
+				if (statusText) {
+					statusLine += " " + statusText;
+				}
+
+				res.writeStatus(statusLine);
 
 				const uniqueHeaderNames = new Set(response.headers.keys());
 				for (const name of uniqueHeaderNames) {
@@ -191,25 +217,82 @@ export function createServer(
 						res.writeHeader(name, response.headers.get(name)!);
 					}
 				}
+			}
 
-				if (!response.body) {
-					res.end();
-				}
+			if (!body) {
+				writeHead();
+				res.cork(() => {
+					res.endWithoutBody();
+				});
+				finished = true;
+				return;
+			}
+
+			async function writeAndAwait(chunk: Uint8Array) {
+				await new Promise<void>((resolve) => {
+					res.cork(() => {
+						const backpressure = !res.write(chunk);
+						if (backpressure) {
+							// TODO: Handle backpressure
+						}
+						resolve();
+					});
+				});
+			}
+
+			let setImmediateFired = false;
+			setImmediate(() => {
+				setImmediateFired = true;
 			});
 
-			if (response.body) {
-				let lastChunk: Uint8Array | undefined;
-				for await (const chunk of response.body as any as AsyncIterable<Uint8Array>) {
-					if (lastChunk) {
-						res.cork(() => res.write(lastChunk!));
-					}
-					lastChunk = chunk;
+			const chunks: Uint8Array[] = [];
+			let bufferWritten = false;
+			for await (const chunk of body) {
+				if (signal.aborted) {
+					body.cancel().catch(() => {});
+					return;
 				}
+				if (setImmediateFired) {
+					if (!bufferWritten) {
+						res.cork(() => {
+							writeHead();
+							for (const chunk of chunks) {
+								// TODO: Handle backpressure
+								res.write(chunk);
+							}
+						});
 
-				if (lastChunk) {
-					res.cork(() => res.end(lastChunk!));
+						bufferWritten = true;
+					}
+
+					await writeAndAwait(chunk);
+					if (signal.aborted) {
+						body.cancel().catch(() => {});
+						return;
+					}
+				} else {
+					chunks.push(chunk);
 				}
 			}
+
+			if (signal.aborted) return;
+
+			if (setImmediateFired) {
+				res.cork(() => {
+					res.end();
+				});
+				finished = true;
+				return;
+			}
+
+			// We were able to read the whole body. Write at once.
+			const buffer = Buffer.concat(chunks);
+			res.cork(() => {
+				writeHead();
+				res.end(buffer);
+			});
+
+			finished = true;
 		}
 	});
 }
